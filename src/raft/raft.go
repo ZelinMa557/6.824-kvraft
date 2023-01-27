@@ -437,6 +437,10 @@ func (rf *Raft) toCandidate() {
 }
 
 func (rf *Raft) toLeader() {
+	rf.stateLock.Lock()
+	rf.state.nextIndex = make([]int, 0)
+	rf.state.matchIndex = make([]int, 0)
+	rf.stateLock.Unlock()
 	rf.typeLock.Lock()
 	rf.currentType = Leader
 	fmt.Println(rf.me, "become leader")
@@ -445,13 +449,9 @@ func (rf *Raft) toLeader() {
 }
 
 func (rf *Raft) LeaderBoardcast() {
-	// var wg sync.WaitGroup
-	// wg.Add(len(rf.peers) - 1)
 	rf.stateLock.Lock()
 	term := rf.state.currentTerm
 	rf.stateLock.Unlock()
-	// succ := 0
-	// var mu sync.Mutex
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			args := AppendEntryArgs{}
