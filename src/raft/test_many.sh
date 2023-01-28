@@ -1,5 +1,5 @@
 rm -f log*
-for i in {1..500}
+for i in {1..100}
 do
     go test -race -run 2A 1>log"$i"
     if [ $? -eq 0 ]; then

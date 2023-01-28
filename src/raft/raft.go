@@ -56,8 +56,8 @@ const (
 )
 
 type LogEntry struct {
-	command string
-	term    int
+	Command interface{}
+	Term    int
 }
 
 type RaftState struct {
@@ -206,11 +206,25 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-type AppendEntryArgs struct {
+type HeartBeatArgs struct {
 	LeaderTerm int
 }
 
+type HeartBeatReply struct {
+}
+
+type AppendEntryArgs struct {
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
 type AppendEntryReply struct {
+	Term    int
+	Succuss bool
 }
 
 //
@@ -246,10 +260,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	rf.state.votedFor = args.CandidateId
 	reply.VoteGranted = true
+	rf.timeLock.Lock()
+	rf.startTime = time.Now()
+	rf.timeLock.Unlock()
 	fmt.Printf("%v vote %v on term %v\n", rf.me, args.CandidateId, rf.state.currentTerm)
 }
 
-func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
+func (rf *Raft) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) {
 	rf.stateLock.Lock()
 	rf.timeLock.Lock()
 	if args.LeaderTerm >= rf.state.currentTerm {
@@ -258,6 +275,69 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 	rf.timeLock.Unlock()
 	rf.stateLock.Unlock()
+}
+
+func min(a int, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
+	rf.stateLock.Lock()
+	defer rf.stateLock.Unlock()
+	reply.Term = rf.state.currentTerm
+	reply.Succuss = false
+	// Reply false if term < currentTerm
+	if args.Term < rf.state.currentTerm {
+		return
+	}
+	// Heartbeat
+	rf.timeLock.Lock()
+	rf.startTime = time.Now()
+	rf.toFollower()
+	rf.timeLock.Unlock()
+	if len(args.Entries) == 0 {
+		reply.Succuss = true
+		return
+	}
+	// Reply false if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm
+	if args.PrevLogIndex >= 0 {
+		if len(rf.state.log) < args.PrevLogIndex+1 {
+			return
+		} else if len(rf.state.log) == 0 && args.PrevLogIndex != -1 {
+			return
+		} else if rf.state.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			return
+		}
+	}
+	// If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it
+	start := 0
+	if len(rf.state.log) > args.PrevLogIndex+1 {
+		i := args.PrevLogIndex + 1
+		for ; i < len(rf.state.log); i++ {
+			if rf.state.log[i].Term != args.Entries[start].Term {
+				break
+			}
+			start++
+		}
+		if i != len(rf.state.log) {
+			rf.state.log = rf.state.log[:i]
+		}
+	}
+	// Append any new entries not already in the log
+	rf.state.log = append(rf.state.log, args.Entries[start:]...)
+	// If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.state.commitedIndex {
+		rf.state.commitedIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+	}
+	reply.Succuss = true
 }
 
 //
@@ -299,8 +379,38 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
+func (rf *Raft) sendHeartBeat(server int, args *HeartBeatArgs, reply *HeartBeatReply) bool {
+	ok := rf.peers[server].Call("Raft.HeartBeat", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntry(server int) bool {
+	args := AppendEntryArgs{LeaderID: rf.me}
+	reply := AppendEntryReply{}
+	rf.stateLock.Lock()
+	args.Term = rf.state.currentTerm
+	args.LeaderCommit = rf.state.commitedIndex
+	args.Entries = make([]LogEntry, 0)
+	if rf.state.matchIndex[server] < len(rf.state.log)-1 {
+		args.Entries = rf.state.log[rf.state.matchIndex[server]+1:]
+		args.PrevLogIndex = rf.state.matchIndex[server]
+		if args.PrevLogIndex != -1 {
+			args.PrevLogTerm = rf.state.log[args.PrevLogIndex].Term
+		}
+	}
+	rf.stateLock.Unlock()
+	ok := rf.peers[server].Call("Raft.AppendEntry", &args, &reply)
+	if ok {
+		if reply.Succuss && len(args.Entries) > 0 {
+			rf.stateLock.Lock()
+			rf.state.matchIndex[server] = len(rf.state.log) - 1
+			rf.stateLock.Unlock()
+		} else {
+			if reply.Term > args.Term {
+				rf.toFollower()
+			}
+		}
+	}
 	return ok
 }
 
@@ -319,12 +429,18 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
+	_, isLeader := rf.GetState()
+	if !isLeader {
+		return -1, -1, false
+	}
 	// Your code here (2B).
-
+	rf.stateLock.Lock()
+	defer rf.stateLock.Unlock()
+	term := rf.state.currentTerm
+	index := len(rf.state.log)
+	entry := LogEntry{Term: term, Command: command}
+	rf.state.log = append(rf.state.log, entry)
+	rf.LeaderBoardcast()
 	return index, term, isLeader
 }
 
@@ -348,7 +464,7 @@ func (rf *Raft) Kill() {
 func (rf *Raft) getLastTermIndex() (int, int) {
 	term := 0
 	if len(rf.state.log) > 0 {
-		term = rf.state.log[len(rf.state.log)-1].term
+		term = rf.state.log[len(rf.state.log)-1].Term
 	}
 	return term, len(rf.state.log)
 }
@@ -402,7 +518,17 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) toCandidate() {
+	rf.typeLock.Lock()
+	rf.currentType = Candidate
+	rf.typeLock.Unlock()
 	time.Sleep(time.Millisecond * time.Duration(rand.Int()%interval))
+	rf.typeLock.Lock()
+	if rf.currentType != Candidate {
+		rf.typeLock.Unlock()
+		return
+	}
+	rf.typeLock.Unlock()
+
 	rf.stateLock.Lock()
 	rf.state.currentTerm += 1
 	rf.state.votedFor = rf.me
@@ -413,9 +539,9 @@ func (rf *Raft) toCandidate() {
 	rf.startTime = time.Now()
 	rf.timeLock.Unlock()
 
-	rf.typeLock.Lock()
-	rf.currentType = Candidate
-	rf.typeLock.Unlock()
+	// rf.typeLock.Lock()
+	// rf.currentType = Candidate
+	// rf.typeLock.Unlock()
 
 	rf.voteLock.Lock()
 	rf.getVoted = 1
@@ -438,8 +564,12 @@ func (rf *Raft) toCandidate() {
 
 func (rf *Raft) toLeader() {
 	rf.stateLock.Lock()
-	rf.state.nextIndex = make([]int, 0)
-	rf.state.matchIndex = make([]int, 0)
+	rf.state.nextIndex = make([]int, len(rf.peers))
+	rf.state.matchIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.state.nextIndex[i] = len(rf.state.log)
+		rf.state.matchIndex[i] = -1
+	}
 	rf.stateLock.Unlock()
 	rf.typeLock.Lock()
 	rf.currentType = Leader
@@ -449,17 +579,11 @@ func (rf *Raft) toLeader() {
 }
 
 func (rf *Raft) LeaderBoardcast() {
-	rf.stateLock.Lock()
-	term := rf.state.currentTerm
-	rf.stateLock.Unlock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			args := AppendEntryArgs{}
-			reply := AppendEntryReply{}
-			args.LeaderTerm = term
 			server := i
 			go func() {
-				rf.sendAppendEntry(server, &args, &reply)
+				rf.sendAppendEntry(server)
 			}()
 		}
 	}
