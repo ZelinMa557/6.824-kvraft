@@ -293,8 +293,9 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// Heartbeat
 	rf.timeLock.Lock()
 	rf.startTime = time.Now()
-	rf.toFollower()
+	fmt.Printf("Follower %v recv heartbeat %v\n", rf.me, rf.startTime)
 	rf.timeLock.Unlock()
+	rf.toFollower()
 	if len(args.Entries) == 0 {
 		reply.Succuss = true
 		// If leaderCommit > commitIndex, set commitIndex =
@@ -345,10 +346,10 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		// copy := args.Entries[start:]
 		// rf.state.log = append(rf.state.log, copy...)
 		rf.state.log = append(rf.state.log, args.Entries[start:]...)
-		for k, v := range rf.state.log {
-			fmt.Printf("idx:%v command:%v ", k, v)
-		}
-		fmt.Printf("\n")
+		// for k, v := range rf.state.log {
+		// 	fmt.Printf("idx:%v command:%v ", k, v)
+		// }
+		// fmt.Printf("\n")
 	}
 	// If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
@@ -413,7 +414,8 @@ func (rf *Raft) sendAppendEntry(server int) bool {
 	args.LeaderCommit = rf.state.commitedIndex
 	args.Entries = make([]LogEntry, 0)
 	if len(rf.state.log) > 0 && rf.state.nextIndex[server] <= (len(rf.state.log)-1) {
-		args.Entries = rf.state.log[rf.state.nextIndex[server]:]
+		args.Entries = make([]LogEntry, len(rf.state.log)-rf.state.nextIndex[server])
+		copy(args.Entries, rf.state.log[rf.state.nextIndex[server]:])
 		args.PrevLogIndex = rf.state.nextIndex[server] - 1
 		if args.PrevLogIndex >= 0 {
 			args.PrevLogTerm = rf.state.log[args.PrevLogIndex].Term
@@ -538,12 +540,12 @@ func (rf *Raft) ticker() {
 			if voted > len(rf.peers)/2 {
 				rf.toLeader()
 			} else if rf.getTime() > MaxTime {
-				fmt.Println("raft", rf.me, "try to restart a election")
+				fmt.Println("raft", rf.me, "try to restart a election", time.Now())
 				rf.toCandidate()
 			}
 		} else if ty == Follower {
 			if rf.getTime() > MaxTime {
-				fmt.Println("raft", rf.me, "try to start a election")
+				fmt.Println("raft", rf.me, "try to start a election", time.Now())
 				rf.toCandidate()
 			}
 		}
@@ -625,6 +627,7 @@ func (rf *Raft) LeaderBoardcast() {
 }
 
 func (rf *Raft) LeaderCommit() {
+	fmt.Printf("leader %v tick %v\n", rf.me, time.Now())
 	rf.stateLock.Lock()
 	arr := make([]int, 0)
 	for i, v := range rf.state.matchIndex {
