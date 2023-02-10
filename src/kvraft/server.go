@@ -40,6 +40,12 @@ type OpResult struct {
 	Value string
 	Err   Err
 }
+
+type OpRecord struct {
+	request Op
+	result  OpResult
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -50,10 +56,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	storage           map[string]string
-	clientSequenceNum map[int]int
-	cmdChan           map[int]chan OpResult
-	lastApplied       int
+	storage     map[string]string
+	cmdChan     map[int]chan OpResult
+	cmdRecord   map[int]OpRecord
+	lastApplied int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -180,6 +186,13 @@ func (kv *KVServer) ApplyWorker() {
 				}
 				cmd := msg.Command.(Op)
 				res := OpResult{Err: OK}
+				if record, ok := kv.cmdRecord[cmd.Client]; ok && record.request.SequenceNum == cmd.SequenceNum {
+					if ch, ok := kv.cmdChan[msg.CommandIndex]; ok {
+						ch <- res
+					}
+					kv.mu.Unlock()
+					continue
+				}
 				switch cmd.Type {
 				case "Get":
 					if _, ok := kv.storage[cmd.Key]; !ok {
@@ -196,6 +209,7 @@ func (kv *KVServer) ApplyWorker() {
 						kv.storage[cmd.Key] += cmd.Value
 					}
 				}
+				kv.cmdRecord[cmd.Client] = OpRecord{request: cmd, result: res}
 				if ch, ok := kv.cmdChan[msg.CommandIndex]; ok {
 					ch <- res
 				} else {
@@ -238,6 +252,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.storage = make(map[string]string)
 	kv.cmdChan = make(map[int]chan OpResult)
+	kv.cmdRecord = make(map[int]OpRecord)
 	kv.lastApplied = 0
 	DPrintf("make server %v\n", kv.me)
 	go kv.ApplyWorker()
