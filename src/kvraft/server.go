@@ -1,15 +1,22 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 )
 
-const Debug = false
+const Debug = true
+
+const (
+	TimeOut  = 1000
+	Interval = 10
+)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,13 +25,21 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type        string
+	Client      int
+	SequenceNum int
+	Key         string
+	Value       string
 }
 
+type OpResult struct {
+	Value string
+	Err   Err
+}
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -35,15 +50,101 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	storage           map[string]string
+	clientSequenceNum map[int]int
+	cmdChan           map[int]chan OpResult
+	lastApplied       int
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{
+		Type:        "Get",
+		Client:      args.ClientID,
+		SequenceNum: args.SequenceID,
+		Key:         args.Key,
+	}
+	index, _, isleader := kv.rf.Start(op)
+	if !isleader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("%v start command %v\n", kv.me, args)
+	ch := make(chan OpResult, 1)
+	kv.mu.Lock()
+	kv.cmdChan[index] = ch
+	kv.mu.Unlock()
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.cmdChan, index)
+		close(ch)
+		kv.mu.Unlock()
+	}()
+	t := time.NewTimer(TimeOut * time.Millisecond)
+	defer t.Stop()
+	finish_or_timeout := false
+	for !finish_or_timeout {
+		select {
+		case result := <-ch:
+			reply.Value, reply.Err = result.Value, result.Err
+			finish_or_timeout = true
+			DPrintf("%v finish %v\n", kv.me, index)
+			break
+		case <-t.C:
+			reply.Value, reply.Err = "", ErrTimeOut
+			finish_or_timeout = true
+			DPrintf("%v %v tiem out\n", kv.me, index)
+			break
+		default:
+			time.Sleep(Interval * time.Millisecond)
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{
+		Type:        args.Op,
+		Client:      args.ClientID,
+		SequenceNum: args.SequenceID,
+		Key:         args.Key,
+		Value:       args.Value,
+	}
+	index, _, isleader := kv.rf.Start(op)
+	if !isleader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("%v start command %v\n", kv.me, args)
+	ch := make(chan OpResult, 1)
+	kv.mu.Lock()
+	kv.cmdChan[index] = ch
+	kv.mu.Unlock()
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.cmdChan, index)
+		close(ch)
+		kv.mu.Unlock()
+	}()
+	t := time.NewTimer(TimeOut * time.Millisecond)
+	defer t.Stop()
+	finish_or_timeout := false
+	for !finish_or_timeout {
+		select {
+		case result := <-ch:
+			DPrintf("%v finish %v\n", kv.me, index)
+			reply.Err = result.Err
+			finish_or_timeout = true
+			break
+		case <-t.C:
+			reply.Err = ErrTimeOut
+			finish_or_timeout = true
+			DPrintf("%v %v tiem out\n", kv.me, index)
+			break
+		default:
+			time.Sleep(Interval * time.Millisecond)
+		}
+	}
 }
 
 //
@@ -65,6 +166,47 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) ApplyWorker() {
+	for !kv.killed() {
+		select {
+		case msg := <-kv.applyCh:
+			if msg.CommandValid {
+				kv.mu.Lock()
+				if msg.CommandIndex <= kv.lastApplied {
+					kv.mu.Unlock()
+					continue
+				}
+				cmd := msg.Command.(Op)
+				res := OpResult{Err: OK}
+				switch cmd.Type {
+				case "Get":
+					if _, ok := kv.storage[cmd.Key]; !ok {
+						res.Err = ErrNoKey
+					} else {
+						res.Value = kv.storage[cmd.Key]
+					}
+				case "Put":
+					kv.storage[cmd.Key] = cmd.Value
+				case "Append":
+					if _, ok := kv.storage[cmd.Key]; !ok {
+						kv.storage[cmd.Key] = cmd.Value
+					} else {
+						kv.storage[cmd.Key] += cmd.Value
+					}
+				}
+				if ch, ok := kv.cmdChan[msg.CommandIndex]; ok {
+					ch <- res
+				} else {
+				}
+				kv.lastApplied++
+				kv.mu.Unlock()
+			} else if msg.SnapshotValid {
+
+			}
+		}
+	}
 }
 
 //
@@ -94,6 +236,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.storage = make(map[string]string)
+	kv.cmdChan = make(map[int]chan OpResult)
+	kv.lastApplied = 0
+	DPrintf("make server %v\n", kv.me)
+	go kv.ApplyWorker()
 
 	// You may need initialization code here.
 
