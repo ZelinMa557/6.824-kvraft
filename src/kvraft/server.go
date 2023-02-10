@@ -84,6 +84,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Lock()
 		delete(kv.cmdChan, index)
 		close(ch)
+		if _, isleader := kv.rf.GetState(); isleader == false {
+			reply.Err = ErrWrongLeader
+		}
 		kv.mu.Unlock()
 	}()
 	t := time.NewTimer(TimeOut * time.Millisecond)
@@ -94,12 +97,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		case result := <-ch:
 			reply.Value, reply.Err = result.Value, result.Err
 			finish_or_timeout = true
-			DPrintf("%v finish %v\n", kv.me, index)
 			break
 		case <-t.C:
 			reply.Value, reply.Err = "", ErrTimeOut
 			finish_or_timeout = true
-			DPrintf("%v %v tiem out\n", kv.me, index)
 			break
 		default:
 			time.Sleep(Interval * time.Millisecond)
@@ -130,6 +131,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Lock()
 		delete(kv.cmdChan, index)
 		close(ch)
+		if _, isleader := kv.rf.GetState(); isleader == false {
+			reply.Err = ErrWrongLeader
+		}
 		kv.mu.Unlock()
 	}()
 	t := time.NewTimer(TimeOut * time.Millisecond)
@@ -138,14 +142,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	for !finish_or_timeout {
 		select {
 		case result := <-ch:
-			DPrintf("%v finish %v\n", kv.me, index)
 			reply.Err = result.Err
 			finish_or_timeout = true
 			break
 		case <-t.C:
 			reply.Err = ErrTimeOut
 			finish_or_timeout = true
-			DPrintf("%v %v tiem out\n", kv.me, index)
 			break
 		default:
 			time.Sleep(Interval * time.Millisecond)
@@ -188,11 +190,12 @@ func (kv *KVServer) ApplyWorker() {
 				res := OpResult{Err: OK}
 				if record, ok := kv.cmdRecord[cmd.Client]; ok && record.request.SequenceNum == cmd.SequenceNum {
 					if ch, ok := kv.cmdChan[msg.CommandIndex]; ok {
-						ch <- res
+						ch <- kv.cmdRecord[cmd.Client].result
 					}
 					kv.mu.Unlock()
 					continue
 				}
+				_, isleader := kv.rf.GetState()
 				switch cmd.Type {
 				case "Get":
 					if _, ok := kv.storage[cmd.Key]; !ok {
@@ -202,11 +205,17 @@ func (kv *KVServer) ApplyWorker() {
 					}
 				case "Put":
 					kv.storage[cmd.Key] = cmd.Value
+					if isleader {
+						DPrintf("%v put key %v value %v\n", kv.me, cmd.Key, cmd.Value)
+					}
 				case "Append":
 					if _, ok := kv.storage[cmd.Key]; !ok {
 						kv.storage[cmd.Key] = cmd.Value
 					} else {
 						kv.storage[cmd.Key] += cmd.Value
+					}
+					if isleader {
+						DPrintf("%v append %v to key %v, then %v\n", kv.me, cmd.Value, cmd.Key, kv.storage[cmd.Key])
 					}
 				}
 				kv.cmdRecord[cmd.Client] = OpRecord{request: cmd, result: res}

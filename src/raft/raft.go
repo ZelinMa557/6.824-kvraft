@@ -622,7 +622,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	// Your code here (2B).
 	rf.stateLock.Lock()
-	defer rf.stateLock.Unlock()
+	defer func() {
+		rf.stateLock.Unlock()
+		rf.LeaderCommit()
+	}()
 	term := rf.state.currentTerm
 	entry := LogEntry{Term: term, Command: command}
 	rf.state.log = append(rf.state.log, entry)
@@ -699,11 +702,7 @@ func (rf *Raft) ticker() {
 				rf.toCandidate()
 			}
 		}
-		if ty == Leader {
-			time.Sleep(time.Millisecond * time.Duration(interval))
-		} else {
-			time.Sleep(time.Millisecond * time.Duration(interval/3))
-		}
+		time.Sleep(time.Millisecond * time.Duration(interval/5))
 	}
 }
 
@@ -831,7 +830,7 @@ func (rf *Raft) ApplyWorker() {
 			rf.state.lastApplied += len(jobs)
 			rf.stateLock.Unlock()
 		}
-		time.Sleep(time.Millisecond * time.Duration(interval/2))
+		time.Sleep(time.Millisecond * time.Duration(interval/4))
 	}
 }
 func (rf *Raft) toFollower() {
