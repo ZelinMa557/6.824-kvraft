@@ -158,6 +158,10 @@ func (rf *Raft) persist() {
 	rf.persister.SaveRaftState(data)
 }
 
+func (rf *Raft) GetPersistSize() int {
+	return len(rf.persister.raftstate)
+}
+
 //
 // restore previously persisted state.
 //

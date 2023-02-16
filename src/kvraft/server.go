@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -42,8 +43,8 @@ type OpResult struct {
 }
 
 type OpRecord struct {
-	request Op
-	result  OpResult
+	Request Op
+	Result  OpResult
 }
 
 type KVServer struct {
@@ -188,9 +189,9 @@ func (kv *KVServer) ApplyWorker() {
 				}
 				cmd := msg.Command.(Op)
 				res := OpResult{Err: OK}
-				if record, ok := kv.cmdRecord[cmd.Client]; ok && record.request.SequenceNum == cmd.SequenceNum {
+				if record, ok := kv.cmdRecord[cmd.Client]; ok && record.Request.SequenceNum == cmd.SequenceNum {
 					if ch, ok := kv.cmdChan[msg.CommandIndex]; ok {
-						ch <- kv.cmdRecord[cmd.Client].result
+						ch <- kv.cmdRecord[cmd.Client].Result
 					}
 					kv.mu.Unlock()
 					continue
@@ -218,16 +219,59 @@ func (kv *KVServer) ApplyWorker() {
 						DPrintf("%v append %v to key %v, then %v\n", kv.me, cmd.Value, cmd.Key, kv.storage[cmd.Key])
 					}
 				}
-				kv.cmdRecord[cmd.Client] = OpRecord{request: cmd, result: res}
+				kv.cmdRecord[cmd.Client] = OpRecord{Request: cmd, Result: res}
 				if ch, ok := kv.cmdChan[msg.CommandIndex]; ok {
 					ch <- res
 				} else {
 				}
-				kv.lastApplied++
+				kv.lastApplied = msg.CommandIndex
 				kv.mu.Unlock()
 			} else if msg.SnapshotValid {
-
+				kv.InstallSnapshot(msg.Snapshot)
+				kv.mu.Lock()
+				kv.lastApplied = msg.SnapshotIndex
+				kv.mu.Unlock()
 			}
+		}
+	}
+}
+
+func (kv *KVServer) Snapshot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.storage)
+	e.Encode(kv.cmdRecord)
+	kv.rf.Snapshot(index, w.Bytes())
+}
+
+func (kv *KVServer) InstallSnapshot(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var storage map[string]string
+	var record map[int]OpRecord
+	if d.Decode(&storage) != nil ||
+		d.Decode(&record) != nil {
+		panic("fail to decode snapshot!")
+	} else {
+		kv.storage = storage
+		kv.cmdRecord = record
+	}
+}
+
+func (kv *KVServer) SnapshotWorker() {
+	if kv.maxraftstate != -1 {
+		for {
+			kv.mu.Lock()
+			if kv.rf.GetPersistSize() > kv.maxraftstate {
+				kv.Snapshot(kv.lastApplied)
+			}
+			kv.mu.Unlock()
+			time.Sleep(time.Microsecond * Interval)
 		}
 	}
 }
@@ -263,8 +307,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.cmdChan = make(map[int]chan OpResult)
 	kv.cmdRecord = make(map[int]OpRecord)
 	kv.lastApplied = 0
+	kv.InstallSnapshot(persister.ReadSnapshot())
 	DPrintf("make server %v\n", kv.me)
 	go kv.ApplyWorker()
+	go kv.SnapshotWorker()
 
 	// You may need initialization code here.
 
